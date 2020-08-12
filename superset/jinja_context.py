@@ -1,36 +1,194 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
 """Defines the templating context for SQL Lab"""
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-from __future__ import unicode_literals
-
 import inspect
+import re
+from typing import Any, cast, List, Optional, Tuple, TYPE_CHECKING
+
+from flask import g, request
 from jinja2.sandbox import SandboxedEnvironment
 
-from datetime import datetime, timedelta
-from dateutil.relativedelta import relativedelta
-import time
-import textwrap
-import uuid
-import random
+from superset import jinja_base_context
+from superset.extensions import jinja_context_manager
+from superset.utils.core import convert_legacy_filters_into_adhoc, merge_extra_filters
 
-from superset import app
-from superset.utils import SupersetTemplateException
-
-config = app.config
-BASE_CONTEXT = {
-    'datetime': datetime,
-    'random': random,
-    'relativedelta': relativedelta,
-    'time': time,
-    'timedelta': timedelta,
-    'uuid': uuid,
-}
-BASE_CONTEXT.update(config.get('JINJA_CONTEXT_ADDONS', {}))
+if TYPE_CHECKING:
+    from superset.connectors.sqla.models import (  # pylint: disable=unused-import
+        SqlaTable,
+    )
+    from superset.models.core import Database  # pylint: disable=unused-import
+    from superset.models.sql_lab import Query  # pylint: disable=unused-import
 
 
-class BaseTemplateProcessor(object):
+def filter_values(column: str, default: Optional[str] = None) -> List[str]:
+    """ Gets a values for a particular filter as a list
 
+    This is useful if:
+        - you want to use a filter box to filter a query where the name of filter box
+          column doesn't match the one in the select statement
+        - you want to have the ability for filter inside the main query for speed
+          purposes
+
+    Usage example::
+
+        SELECT action, count(*) as times
+        FROM logs
+        WHERE action in ( {{ "'" + "','".join(filter_values('action_type')) + "'" }} )
+        GROUP BY action
+
+    :param column: column/filter name to lookup
+    :param default: default value to return if there's no matching columns
+    :return: returns a list of filter values
+    """
+
+    from superset.views.utils import get_form_data
+
+    form_data, _ = get_form_data()
+    convert_legacy_filters_into_adhoc(form_data)
+    merge_extra_filters(form_data)
+
+    return_val = [
+        comparator
+        for filter in form_data.get("adhoc_filters", [])
+        for comparator in (
+            filter["comparator"]
+            if isinstance(filter["comparator"], list)
+            else [filter["comparator"]]
+        )
+        if (
+            filter.get("expressionType") == "SIMPLE"
+            and filter.get("clause") == "WHERE"
+            and filter.get("subject") == column
+            and filter.get("comparator")
+        )
+    ]
+
+    if return_val:
+        return return_val
+
+    if default:
+        return [default]
+
+    return []
+
+
+class ExtraCache:
+    """
+    Dummy class that exposes a method used to store additional values used in
+    calculation of query object cache keys.
+    """
+
+    # Regular expression for detecting the presence of templated methods which could
+    # be added to the cache key.
+    regex = re.compile(
+        r"\{\{.*("
+        r"current_user_id\(.*\)|"
+        r"current_username\(.*\)|"
+        r"cache_key_wrapper\(.*\)|"
+        r"url_param\(.*\)"
+        r").*\}\}"
+    )
+
+    def __init__(self, extra_cache_keys: Optional[List[Any]] = None):
+        self.extra_cache_keys = extra_cache_keys
+
+    def current_user_id(self, add_to_cache_keys: bool = True) -> Optional[int]:
+        """
+        Return the user ID of the user who is currently logged in.
+
+        :param add_to_cache_keys: Whether the value should be included in the cache key
+        :returns: The user ID
+        """
+
+        if hasattr(g, "user") and g.user:
+            if add_to_cache_keys:
+                self.cache_key_wrapper(g.user.id)
+            return g.user.id
+        return None
+
+    def current_username(self, add_to_cache_keys: bool = True) -> Optional[str]:
+        """
+        Return the username of the user who is currently logged in.
+
+        :param add_to_cache_keys: Whether the value should be included in the cache key
+        :returns: The username
+        """
+
+        if g.user:
+            if add_to_cache_keys:
+                self.cache_key_wrapper(g.user.username)
+            return g.user.username
+        return None
+
+    def cache_key_wrapper(self, key: Any) -> Any:
+        """
+        Adds values to a list that is added to the query object used for calculating a
+        cache key.
+
+        This is needed if the following applies:
+            - Caching is enabled
+            - The query is dynamically generated using a jinja template
+            - A `JINJA_CONTEXT_ADDONS` or similar is used as a filter in the query
+
+        :param key: Any value that should be considered when calculating the cache key
+        :return: the original value ``key`` passed to the function
+        """
+        if self.extra_cache_keys is not None:
+            self.extra_cache_keys.append(key)
+        return key
+
+    def url_param(
+        self, param: str, default: Optional[str] = None, add_to_cache_keys: bool = True
+    ) -> Optional[Any]:
+        """
+        Read a url or post parameter and use it in your SQL Lab query.
+
+        When in SQL Lab, it's possible to add arbitrary URL "query string" parameters,
+        and use those in your SQL code. For instance you can alter your url and add
+        `?foo=bar`, as in `{domain}/superset/sqllab?foo=bar`. Then if your query is
+        something like SELECT * FROM foo = '{{ url_param('foo') }}', it will be parsed
+        at runtime and replaced by the value in the URL.
+
+        As you create a visualization form this SQL Lab query, you can pass parameters
+        in the explore view as well as from the dashboard, and it should carry through
+        to your queries.
+
+        Default values for URL parameters can be defined in chart metadata by adding the
+        key-value pair `url_params: {'foo': 'bar'}`
+
+        :param param: the parameter to lookup
+        :param default: the value to return in the absence of the parameter
+        :param add_to_cache_keys: Whether the value should be included in the cache key
+        :returns: The URL parameters
+        """
+
+        from superset.views.utils import get_form_data
+
+        if request.args.get(param):
+            return request.args.get(param, default)
+        form_data, _ = get_form_data()
+        url_params = form_data.get("url_params") or {}
+        result = url_params.get(param, default)
+        if add_to_cache_keys:
+            self.cache_key_wrapper(result)
+        return result
+
+
+class BaseTemplateProcessor:  # pylint: disable=too-few-public-methods
     """Base class for database-specific jinja context
 
     There's this bit of magic in ``process_template`` that instantiates only
@@ -44,9 +202,17 @@ class BaseTemplateProcessor(object):
     and are given access to the ``models.Database`` object and schema
     name. For globally available methods use ``@classmethod``.
     """
-    engine = None
 
-    def __init__(self, database=None, query=None, table=None):
+    engine: Optional[str] = None
+
+    def __init__(
+        self,
+        database: "Database",
+        query: Optional["Query"] = None,
+        table: Optional["SqlaTable"] = None,
+        extra_cache_keys: Optional[List[Any]] = None,
+        **kwargs: Any,
+    ) -> None:
         self.database = database
         self.query = query
         self.schema = None
@@ -54,13 +220,24 @@ class BaseTemplateProcessor(object):
             self.schema = query.schema
         elif table:
             self.schema = table.schema
-        self.context = {}
-        self.context.update(BASE_CONTEXT)
+
+        extra_cache = ExtraCache(extra_cache_keys)
+
+        self.context = {
+            "url_param": extra_cache.url_param,
+            "current_user_id": extra_cache.current_user_id,
+            "current_username": extra_cache.current_username,
+            "cache_key_wrapper": extra_cache.cache_key_wrapper,
+            "filter_values": filter_values,
+            "form_data": {},
+        }
+        self.context.update(kwargs)
+        self.context.update(jinja_base_context)
         if self.engine:
             self.context[self.engine] = self
         self.env = SandboxedEnvironment()
 
-    def process_template(self, sql):
+    def process_template(self, sql: str, **kwargs: Any) -> str:
         """Processes a sql template
 
         >>> sql = "SELECT '{{ datetime(2017, 1, 1).isoformat() }}'"
@@ -68,7 +245,8 @@ class BaseTemplateProcessor(object):
         "SELECT '2017-01-01T00:00:00'"
         """
         template = self.env.from_string(sql)
-        return template.render(self.context)
+        kwargs.update(self.context)
+        return template.render(kwargs)
 
 
 class PrestoTemplateProcessor(BaseTemplateProcessor):
@@ -77,124 +255,64 @@ class PrestoTemplateProcessor(BaseTemplateProcessor):
     The methods described here are namespaced under ``presto`` in the
     jinja context as in ``SELECT '{{ presto.some_macro_call() }}'``
     """
-    engine = 'presto'
+
+    engine = "presto"
 
     @staticmethod
-    def _partition_query(table_name, limit=0, order_by=None, filters=None):
-        """Returns a partition query
-
-        :param table_name: the name of the table to get partitions from
-        :type table_name: str
-        :param limit: the number of partitions to be returned
-        :type limit: int
-        :param order_by: a list of tuples of field name and a boolean
-            that determines if that field should be sorted in descending
-            order
-        :type order_by: list of (str, bool) tuples
-        :param filters: a list of filters to apply
-        :param filters: dict of field anme  and filter value combinations
-        """
-        limit_clause = "LIMIT {}".format(limit) if limit else ''
-        order_by_clause = ''
-        if order_by:
-            l = []
-            for field, desc in order_by:
-                l.append(field + ' DESC' if desc else '')
-            order_by_clause = 'ORDER BY ' + ', '.join(l)
-
-        where_clause = ''
-        if filters:
-            l = []
-            for field, value in filters.items():
-                l.append("{field} = '{value}'".format(**locals()))
-            where_clause = 'WHERE ' + ' AND '.join(l)
-
-        sql = textwrap.dedent("""\
-            SHOW PARTITIONS FROM {table_name}
-            {where_clause}
-            {order_by_clause}
-            {limit_clause}
-        """).format(**locals())
-        return sql
-
-    @staticmethod
-    def _schema_table(table_name, schema):
-        if '.' in table_name:
-            schema, table_name = table_name.split('.')
+    def _schema_table(
+        table_name: str, schema: Optional[str]
+    ) -> Tuple[str, Optional[str]]:
+        if "." in table_name:
+            schema, table_name = table_name.split(".")
         return table_name, schema
 
-    def latest_partition(self, table_name):
-        """Returns the latest (max) partition value for a table
-
-        :param table_name: the name of the table, can be just the table
-            name or a fully qualified table name as ``schema_name.table_name``
-        :type table_name: str
-        >>> latest_partition('foo_table')
-        '2018-01-01'
+    def first_latest_partition(self, table_name: str) -> Optional[str]:
         """
-        table_name, schema = self._schema_table(table_name, self.schema)
-        indexes = self.database.get_indexes(table_name, schema)
-        if len(indexes[0]['column_names']) < 1:
-            raise SupersetTemplateException(
-                "The table should have one partitioned field")
-        elif len(indexes[0]['column_names']) > 1:
-            raise SupersetTemplateException(
-                "The table should have a single partitioned field "
-                "to use this function. You may want to use "
-                "`presto.latest_sub_partition`")
-        part_field = indexes[0]['column_names'][0]
-        sql = self._partition_query(table_name, 1, [(part_field, True)])
-        df = self.database.get_df(sql, schema)
-        return df.to_records(index=False)[0][0]
+        Gets the first value in the array of all latest partitions
 
-    def latest_sub_partition(self, table_name, **kwargs):
-        """Returns the latest (max) partition value for a table
-
-        A filtering criteria should be passed for all fields that are
-        partitioned except for the field to be returned. For example,
-        if a table is partitioned by (``ds``, ``event_type`` and
-        ``event_category``) and you want the latest ``ds``, you'll want
-        to provide a filter as keyword arguments for both
-        ``event_type`` and ``event_category`` as in
-        ``latest_sub_partition('my_table',
-            event_category='page', event_type='click')``
-
-        :param table_name: the name of the table, can be just the table
-            name or a fully qualified table name as ``schema_name.table_name``
-        :type table_name: str
-        :param kwargs: keyword arguments define the filtering criteria
-            on the partition list. There can be many of these.
-        :type kwargs: str
-        >>> latest_sub_partition('sub_partition_table', event_type='click')
-        '2018-01-01'
+        :param table_name: table name in the format `schema.table`
+        :return: the first (or only) value in the latest partition array
+        :raises IndexError: If no partition exists
         """
+
+        latest_partitions = self.latest_partitions(table_name)
+        return latest_partitions[0] if latest_partitions else None
+
+    def latest_partitions(self, table_name: str) -> Optional[List[str]]:
+        """
+        Gets the array of all latest partitions
+
+        :param table_name: table name in the format `schema.table`
+        :return: the latest partition array
+        """
+
+        from superset.db_engine_specs.presto import PrestoEngineSpec
+
         table_name, schema = self._schema_table(table_name, self.schema)
-        indexes = self.database.get_indexes(table_name, schema)
-        part_fields = indexes[0]['column_names']
-        for k in kwargs.keys():
-            if k not in k in part_fields:
-                msg = "Field [{k}] is not part of the partionning key"
-                raise SupersetTemplateException(msg)
-        if len(kwargs.keys()) != len(part_fields) - 1:
-            msg = (
-                "A filter needs to be specified for {} out of the "
-                "{} fields."
-            ).format(len(part_fields)-1, len(part_fields))
-            raise SupersetTemplateException(msg)
+        return cast(PrestoEngineSpec, self.database.db_engine_spec).latest_partition(
+            table_name, schema, self.database
+        )[1]
 
-        for field in part_fields:
-            if field not in kwargs.keys():
-                field_to_return = field
+    def latest_sub_partition(self, table_name: str, **kwargs: Any) -> Any:
+        table_name, schema = self._schema_table(table_name, self.schema)
 
-        sql = self._partition_query(
-            table_name, 1, [(field_to_return, True)], kwargs)
-        df = self.database.get_df(sql, schema)
-        if df.empty:
-            return ''
-        return df.to_dict()[field_to_return][0]
+        from superset.db_engine_specs.presto import PrestoEngineSpec
+
+        return cast(
+            PrestoEngineSpec, self.database.db_engine_spec
+        ).latest_sub_partition(
+            table_name=table_name, schema=schema, database=self.database, **kwargs
+        )
+
+    latest_partition = first_latest_partition
 
 
-template_processors = {}
+class HiveTemplateProcessor(PrestoTemplateProcessor):
+    engine = "hive"
+
+
+# The global template processors from Jinja context manager.
+template_processors = jinja_context_manager.template_processors
 keys = tuple(globals().keys())
 for k in keys:
     o = globals()[k]
@@ -202,6 +320,13 @@ for k in keys:
         template_processors[o.engine] = o
 
 
-def get_template_processor(database, table=None, query=None):
-    TP = template_processors.get(database.backend, BaseTemplateProcessor)
-    return TP(database=database, table=table, query=query)
+def get_template_processor(
+    database: "Database",
+    table: Optional["SqlaTable"] = None,
+    query: Optional["Query"] = None,
+    **kwargs: Any,
+) -> BaseTemplateProcessor:
+    template_processor = template_processors.get(
+        database.backend, BaseTemplateProcessor
+    )
+    return template_processor(database=database, table=table, query=query, **kwargs)
